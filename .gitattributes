@@ -1,0 +1,8 @@
+# Shell scripts must use Unix line endings
+*.sh text eol=lf
+
+# Markdown/text files
+*.md text eol=lf
+
+# Binary files
+*.pdf binary
