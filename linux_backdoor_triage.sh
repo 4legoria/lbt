@@ -8,7 +8,7 @@ set -u
 set -o pipefail
 umask 077
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 SINCE_DAYS=30
 MODE="quick"
 OUT_BASE="/tmp"
@@ -162,10 +162,15 @@ log() {
   printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$MASTER"
 }
 
+progress() {
+  printf '[%s]   -> %s\n' "$(date -u +%FT%TZ)" "$*"
+}
+
 run_to_file() {
   local name="$1"
   shift
   local file="$OUT/$name"
+  progress "$name"
 
   (
     printf '# UTC: %s\n' "$(date -u +%FT%TZ)"
@@ -184,6 +189,7 @@ run_shell_to_file() {
   shift
   local cmd="$*"
   local file="$OUT/$name"
+  progress "$name"
 
   (
     printf '# UTC: %s\n' "$(date -u +%FT%TZ)"
@@ -257,35 +263,147 @@ check_pam() {
 
 check_systemd() {
   module_log "systemd"
-  run_shell_to_file 05_systemd_enabled_services.txt 'command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --type=service --state=enabled --no-pager || true'
-  run_shell_to_file 05_systemd_running_services.txt 'command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service --state=running --no-pager || true'
-  run_shell_to_file 05_systemd_timers.txt 'command -v systemctl >/dev/null 2>&1 && systemctl list-timers --all --no-pager || true'
-  run_shell_to_file 05_systemd_sockets.txt 'command -v systemctl >/dev/null 2>&1 && systemctl list-sockets --all --no-pager || true'
+
+  # systemctl can occasionally block on a degraded/broken D-Bus/systemd state.
+  # Use a bounded timeout when GNU timeout is available.
+  run_shell_to_file 05_systemd_enabled_services.txt '
+if command -v systemctl >/dev/null 2>&1; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20s systemctl list-unit-files --type=service --state=enabled --no-pager || true
+  else
+    systemctl list-unit-files --type=service --state=enabled --no-pager || true
+  fi
+fi'
+
+  run_shell_to_file 05_systemd_running_services.txt '
+if command -v systemctl >/dev/null 2>&1; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20s systemctl list-units --type=service --state=running --no-pager || true
+  else
+    systemctl list-units --type=service --state=running --no-pager || true
+  fi
+fi'
+
+  run_shell_to_file 05_systemd_timers.txt '
+if command -v systemctl >/dev/null 2>&1; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20s systemctl list-timers --all --no-pager || true
+  else
+    systemctl list-timers --all --no-pager || true
+  fi
+fi'
+
+  run_shell_to_file 05_systemd_sockets.txt '
+if command -v systemctl >/dev/null 2>&1; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20s systemctl list-sockets --all --no-pager || true
+  else
+    systemctl list-sockets --all --no-pager || true
+  fi
+fi'
+
+  # Scan only actual unit directories. Do NOT recursively grep all of
+  # /run/systemd; runtime trees may contain transient/special objects.
   run_shell_to_file 05_systemd_unit_files.txt '
-for d in /etc/systemd /run/systemd /usr/local/lib/systemd /usr/lib/systemd /lib/systemd; do
+for d in \
+  /etc/systemd/system \
+  /run/systemd/system \
+  /usr/local/lib/systemd/system \
+  /usr/lib/systemd/system \
+  /lib/systemd/system \
+  /etc/systemd/user \
+  /run/systemd/user \
+  /usr/local/lib/systemd/user \
+  /usr/lib/systemd/user \
+  /lib/systemd/user
+do
   [ -d "$d" ] || continue
-  find "$d" -type f \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) -exec stat -c "%A %U:%G %s %y %n" {} \; 2>/dev/null
+  find "$d" -xdev -type f \
+    \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) \
+    -exec stat -c "%A %U:%G %s %y %n" {} \; 2>/dev/null
 done
+
 while IFS=: read -r user _ uid gid gecos home shell; do
   [ -d "$home/.config/systemd" ] || continue
-  find "$home/.config/systemd" -type f \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) -exec stat -c "%A %U:%G %s %y %n" {} \; 2>/dev/null
+  find "$home/.config/systemd" -xdev -type f \
+    \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) \
+    -exec stat -c "%A %U:%G %s %y %n" {} \; 2>/dev/null
 done < <(getent passwd)'
+
   run_shell_to_file 05_systemd_exec_findings.txt '
-for d in /etc/systemd /run/systemd /usr/local/lib/systemd /usr/lib/systemd /lib/systemd; do
-  [ -d "$d" ] && grep -RniE "^[[:space:]]*Exec(Start|StartPre|StartPost|Reload|Stop|StopPost)=" "$d" 2>/dev/null || true
+PATTERN="^[[:space:]]*Exec(Start|StartPre|StartPost|Reload|Stop|StopPost)="
+
+scan_units() {
+  local d="$1"
+  [ -d "$d" ] || return 0
+  find "$d" -xdev -type f \
+    \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) \
+    -print0 2>/dev/null |
+    xargs -0 -r grep -HnE "$PATTERN" 2>/dev/null || true
+}
+
+for d in \
+  /etc/systemd/system \
+  /run/systemd/system \
+  /usr/local/lib/systemd/system \
+  /usr/lib/systemd/system \
+  /lib/systemd/system \
+  /etc/systemd/user \
+  /run/systemd/user \
+  /usr/local/lib/systemd/user \
+  /usr/lib/systemd/user \
+  /lib/systemd/user
+do
+  scan_units "$d"
 done
+
 while IFS=: read -r user _ uid gid gecos home shell; do
-  [ -d "$home/.config/systemd" ] && grep -RniE "^[[:space:]]*Exec(Start|StartPre|StartPost|Reload|Stop|StopPost)=" "$home/.config/systemd" 2>/dev/null || true
+  scan_units "$home/.config/systemd"
 done < <(getent passwd)'
+
   run_shell_to_file 05_systemd_suspicious_paths.txt '
-for d in /etc/systemd /run/systemd /usr/local/lib/systemd /usr/lib/systemd /lib/systemd; do
-  [ -d "$d" ] && grep -RniE "Exec(Start|StartPre|StartPost|Reload|Stop|StopPost)=.*(/tmp/|/var/tmp/|/dev/shm/|/home/|/root/\\.)" "$d" 2>/dev/null || true
-done'
+PATTERN="Exec(Start|StartPre|StartPost|Reload|Stop|StopPost)=.*(/tmp/|/var/tmp/|/dev/shm/|/home/|/root/\\.)"
+
+scan_units() {
+  local d="$1"
+  [ -d "$d" ] || return 0
+  find "$d" -xdev -type f \
+    \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) \
+    -print0 2>/dev/null |
+    xargs -0 -r grep -HnE "$PATTERN" 2>/dev/null || true
+}
+
+for d in \
+  /etc/systemd/system \
+  /run/systemd/system \
+  /usr/local/lib/systemd/system \
+  /usr/lib/systemd/system \
+  /lib/systemd/system \
+  /etc/systemd/user \
+  /run/systemd/user \
+  /usr/local/lib/systemd/user \
+  /usr/lib/systemd/user \
+  /lib/systemd/user
+do
+  scan_units "$d"
+done
+
+while IFS=: read -r user _ uid gid gecos home shell; do
+  scan_units "$home/.config/systemd"
+done < <(getent passwd)'
+
   run_shell_to_file 05_systemd_generators.txt '
-for d in /etc/systemd/system-generators /run/systemd/system-generators /usr/local/lib/systemd/system-generators /usr/lib/systemd/system-generators /lib/systemd/system-generators; do
+for d in \
+  /etc/systemd/system-generators \
+  /run/systemd/system-generators \
+  /usr/local/lib/systemd/system-generators \
+  /usr/lib/systemd/system-generators \
+  /lib/systemd/system-generators
+do
   [ -d "$d" ] || continue
   echo "===== $d ====="
-  find "$d" -maxdepth 1 -type f -exec stat -c "%A %U:%G %s %y %n" {} \; 2>/dev/null
+  find "$d" -maxdepth 1 -xdev -type f \
+    -exec stat -c "%A %U:%G %s %y %n" {} \; 2>/dev/null
 done'
 }
 
