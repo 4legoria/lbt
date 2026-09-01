@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/4legoria/lbt/schema/lbt-run.schema.json",
+  "title": "LBT run metadata",
+  "type": "object",
+  "required": [
+    "@timestamp",
+    "ecs",
+    "event",
+    "host",
+    "os",
+    "agent",
+    "lbt"
+  ],
+  "properties": {
+    "@timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ecs": {
+      "type": "object",
+      "required": [
+        "version"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "event": {
+      "type": "object"
+    },
+    "host": {
+      "type": "object",
+      "required": [
+        "hostname"
+      ],
+      "properties": {
+        "hostname": {
+          "type": "string"
+        }
+      }
+    },
+    "os": {
+      "type": "object"
+    },
+    "agent": {
+      "type": "object"
+    },
+    "lbt": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "run_id",
+        "mode",
+        "since_days",
+        "checks",
+        "format",
+        "json_failures",
+        "evidence_directory"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "quick",
+            "full"
+          ]
+        },
+        "since_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "checks": {
+          "type": "string"
+        },
+        "format": {
+          "enum": [
+            "jsonl",
+            "both"
+          ]
+        },
+        "json_engine": {
+          "enum": [
+            "jq",
+            "python3"
+          ]
+        },
+        "json_failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_directory": {
+          "type": "string"
+        },
+        "records_file": {
+          "const": "results.jsonl"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

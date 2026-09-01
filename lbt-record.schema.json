@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/4legoria/lbt/schema/lbt-record.schema.json",
+  "title": "LBT check record",
+  "type": "object",
+  "required": [
+    "@timestamp",
+    "ecs",
+    "event",
+    "host",
+    "agent",
+    "lbt"
+  ],
+  "properties": {
+    "@timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "message": {
+      "type": "string"
+    },
+    "ecs": {
+      "type": "object",
+      "required": [
+        "version"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "event": {
+      "type": "object",
+      "required": [
+        "kind",
+        "category",
+        "type",
+        "action",
+        "module",
+        "dataset",
+        "outcome",
+        "start",
+        "end",
+        "duration"
+      ],
+      "properties": {
+        "kind": {
+          "const": "state"
+        },
+        "category": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "action": {
+          "const": "collect"
+        },
+        "module": {
+          "type": "string"
+        },
+        "dataset": {
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "success",
+            "failure"
+          ]
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "duration": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "host": {
+      "type": "object",
+      "required": [
+        "hostname"
+      ],
+      "properties": {
+        "hostname": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "agent": {
+      "type": "object",
+      "required": [
+        "name",
+        "type",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "const": "lbt"
+        },
+        "type": {
+          "const": "lbt"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lbt": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "run_id",
+        "mode",
+        "since_days",
+        "check",
+        "command",
+        "exit_status",
+        "output"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "quick",
+            "full"
+          ]
+        },
+        "since_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "check": {
+          "type": "object",
+          "required": [
+            "id",
+            "name"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "command": {
+          "type": "string"
+        },
+        "exit_status": {
+          "type": "integer"
+        },
+        "output": {
+          "type": "object",
+          "required": [
+            "group",
+            "stdout",
+            "stderr"
+          ],
+          "properties": {
+            "group": {
+              "type": "string"
+            },
+            "stdout": {
+              "type": "string"
+            },
+            "stderr": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

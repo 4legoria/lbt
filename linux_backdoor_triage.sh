@@ -1,51 +1,53 @@
 #!/usr/bin/env bash
-# Linux Backdoor Triage Collector
-# Defensive/live-response utility. Read-only with respect to the investigated
+# LBT - Linux Backdoor Triage Collector
+# Defensive/live-response utility. Read-only with respect to investigated
 # configuration; it only creates files under the selected output directory.
-# Run from a trusted copy when possible.
 
 set -u
 set -o pipefail
 umask 077
 
-VERSION="0.2.1"
+VERSION="0.4.0"
+SCHEMA_VERSION="1.0.0"
+ECS_VERSION="9.5.0"
+
 SINCE_DAYS=30
 MODE="quick"
 OUT_BASE="/tmp"
 CHECK_FILTER="all"
+FORMAT="text"
+JSON_ENGINE=""
+JSON_FAILURES=0
+CURRENT_MODULE="core"
 
 VALID_CHECKS="system accounts ssh pam systemd cron startup loader integrity privileges processes network kernel containers timeline optional"
 
 usage() {
   cat <<USAGE
-Linux Backdoor Triage Collector v${VERSION}
+LBT - Linux Backdoor Triage Collector v${VERSION}
 
 Usage:
   sudo ./linux_backdoor_triage.sh [options]
 
 Options:
-  --full              Include slower recent-file, temp-file and web-root scans.
-  --since-days N      Look back N days for recent-file/log checks (default: 30).
-  --output DIR        Parent directory for the evidence folder (default: /tmp).
-  --check LIST        Run only selected modules (comma-separated).
-                      Example: --check ssh,pam,systemd
-  --list-checks       Show available module names.
+  --full              Add slower recent-file, temp-file and web-root scans.
+  --since-days N      Lookback window for recent-file/log checks (default: 30).
+  --output DIR        Parent directory for evidence (default: /tmp).
+  --check LIST        Run selected modules, comma-separated.
+  --format FORMAT     text, jsonl or both (default: text).
+  --list-checks       Show available modules.
   -h, --help          Show this help.
-
-Available checks:
-  ${VALID_CHECKS}
 
 Examples:
   sudo ./linux_backdoor_triage.sh
   sudo ./linux_backdoor_triage.sh --check ssh,pam,systemd
-  sudo ./linux_backdoor_triage.sh --full --since-days 14 --output /mnt/evidence
+  sudo ./linux_backdoor_triage.sh --format jsonl
+  sudo ./linux_backdoor_triage.sh --format both --full --since-days 14
 
 Notes:
   - No packages are installed and no network requests are made.
-  - Live response changes some volatile state/logging by definition.
-  - --full adds broad, slower scans in addition to the selected modules.
-  - If kernel/rootkit compromise is strongly suspected, validate offline from
-    trusted media rather than trusting only local userland output.
+  - JSONL requires jq or python3 on the investigated host.
+  - Live response is not forensically neutral.
 USAGE
 }
 
@@ -91,6 +93,27 @@ check_selected() {
   esac
 }
 
+want_text() {
+  [[ "$FORMAT" == "text" || "$FORMAT" == "both" ]]
+}
+
+want_jsonl() {
+  [[ "$FORMAT" == "jsonl" || "$FORMAT" == "both" ]]
+}
+
+detect_json_engine() {
+  want_jsonl || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    JSON_ENGINE="jq"
+  elif command -v python3 >/dev/null 2>&1; then
+    JSON_ENGINE="python3"
+  else
+    echo "--format $FORMAT requires jq or python3; neither was found." >&2
+    exit 3
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --full)
@@ -121,6 +144,14 @@ while [[ $# -gt 0 ]]; do
       CHECK_FILTER="$2"
       shift 2
       ;;
+    --format)
+      [[ $# -ge 2 ]] || { echo "Missing --format value" >&2; exit 2; }
+      case "$2" in
+        text|jsonl|both) FORMAT="$2" ;;
+        *) echo "Invalid --format: $2 (expected text, jsonl or both)" >&2; exit 2 ;;
+      esac
+      shift 2
+      ;;
     --list-checks)
       list_checks
       exit 0
@@ -138,10 +169,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 validate_check_filter
+detect_json_engine
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_STARTED_AT="$(date -u +%FT%TZ)"
+RUN_STARTED_EPOCH="$(date +%s)"
 HOST_SAFE="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' || true)"
 HOST_SAFE="${HOST_SAFE:-unknown-host}"
+HOST_ARCH="$(uname -m 2>/dev/null || true)"
+
+OS_NAME="Linux"
+OS_VERSION=""
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_NAME="${NAME:-Linux}"
+  OS_VERSION="${VERSION_ID:-${VERSION:-}}"
+fi
 
 mkdir -p -- "$OUT_BASE" || {
   echo "Cannot create output parent directory: $OUT_BASE" >&2
@@ -153,10 +197,15 @@ OUT="$(mktemp -d "${OUT_BASE%/}/linux-backdoor-triage_${HOST_SAFE}_${TS}_XXXXXX"
   exit 1
 }
 
+RUN_ID="$(basename "$OUT")"
 MASTER="$OUT/00_summary.txt"
 ERRORS="$OUT/00_errors.log"
+RESULTS_JSONL="$OUT/results.jsonl"
+RUN_JSON="$OUT/run.json"
+
 : >"$MASTER"
 : >"$ERRORS"
+want_jsonl && : >"$RESULTS_JSONL"
 
 log() {
   printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$MASTER"
@@ -166,42 +215,274 @@ progress() {
   printf '[%s]   -> %s\n' "$(date -u +%FT%TZ)" "$*"
 }
 
+group_file_for() {
+  case "$1" in
+    01_*|02_*) echo "01_system_accounts.txt" ;;
+    03_*|04_*) echo "02_auth_access.txt" ;;
+    05_*|06_*|07_*|08_*) echo "03_persistence.txt" ;;
+    09_*|10_*) echo "04_integrity_privileges.txt" ;;
+    11_*|12_*) echo "05_runtime.txt" ;;
+    13_*|14_*) echo "06_kernel_containers.txt" ;;
+    15_*) echo "07_timeline.txt" ;;
+    16_*) echo "08_extended_hunt.txt" ;;
+    17_*) echo "09_optional_tools.txt" ;;
+    *) echo "99_misc.txt" ;;
+  esac
+}
+
+ecs_category_for() {
+  case "$1" in
+    system) echo "host" ;;
+    accounts|privileges) echo "iam" ;;
+    ssh|pam|timeline) echo "authentication" ;;
+    systemd|cron|startup) echo "configuration" ;;
+    loader) echo "library" ;;
+    integrity) echo "package" ;;
+    processes) echo "process" ;;
+    network) echo "network" ;;
+    kernel) echo "driver" ;;
+    containers|optional) echo "host" ;;
+    full-mode*) echo "file" ;;
+    *) echo "host" ;;
+  esac
+}
+
+append_error_block() {
+  local check_name="$1"
+  local err_file="$2"
+  [[ -s "$err_file" ]] || return 0
+  {
+    printf '\n===== %s =====\n' "$check_name"
+    cat "$err_file"
+  } >>"$ERRORS"
+}
+
+append_text_result() {
+  local name="$1" command_text="$2" out_tmp="$3"
+  local rc="$4" elapsed="$5" started_at="$6" grouped="$7"
+  local file="$OUT/$grouped"
+
+  {
+    printf '\n======================================================================\n'
+    printf 'CHECK: %s\n' "$name"
+    printf 'UTC: %s\n' "$started_at"
+    printf 'COMMAND: %s\n' "$command_text"
+    printf '%s\n\n' '----------------------------------------------------------------------'
+    cat "$out_tmp"
+    printf '\n----------------------------------------------------------------------\n'
+    printf 'EXIT STATUS: %s\n' "$rc"
+    printf 'DURATION: %ss\n' "$elapsed"
+    printf '======================================================================\n'
+  } >>"$file"
+}
+
+emit_json_record_jq() {
+  local name="$1" command_text="$2" out_tmp="$3" err_tmp="$4"
+  local rc="$5" elapsed="$6" started_at="$7" ended_at="$8" grouped="$9"
+  local category outcome duration_ns check_id
+  category="$(ecs_category_for "$CURRENT_MODULE")"
+  [[ "$rc" -eq 0 ]] && outcome="success" || outcome="failure"
+  duration_ns=$((elapsed * 1000000000))
+  check_id="${name%.txt}"
+
+  jq -cn \
+    --rawfile stdout "$out_tmp" \
+    --rawfile stderr "$err_tmp" \
+    --arg ts "$started_at" \
+    --arg end "$ended_at" \
+    --arg msg "LBT check $check_id completed" \
+    --arg ecs_version "$ECS_VERSION" \
+    --arg category "$category" \
+    --arg module "$CURRENT_MODULE" \
+    --arg outcome "$outcome" \
+    --arg host "$HOST_SAFE" \
+    --arg tool_version "$VERSION" \
+    --arg schema_version "$SCHEMA_VERSION" \
+    --arg run_id "$RUN_ID" \
+    --arg mode "$MODE" \
+    --arg check_id "$check_id" \
+    --arg check_name "$name" \
+    --arg command "$command_text" \
+    --arg group "$grouped" \
+    --argjson since_days "$SINCE_DAYS" \
+    --argjson exit_status "$rc" \
+    --argjson duration "$duration_ns" \
+    '{
+      "@timestamp": $ts,
+      "message": $msg,
+      "ecs": {"version": $ecs_version},
+      "event": {
+        "kind": "state",
+        "category": [$category],
+        "type": ["info"],
+        "action": "collect",
+        "module": $module,
+        "dataset": ("lbt." + $module),
+        "outcome": $outcome,
+        "start": $ts,
+        "end": $end,
+        "duration": $duration
+      },
+      "host": {"hostname": $host},
+      "agent": {"name": "lbt", "type": "lbt", "version": $tool_version},
+      "tags": ["linux", "live-response", "backdoor-triage"],
+      "lbt": {
+        "schema_version": $schema_version,
+        "run_id": $run_id,
+        "mode": $mode,
+        "since_days": $since_days,
+        "check": {"id": $check_id, "name": $check_name},
+        "command": $command,
+        "exit_status": $exit_status,
+        "output": {
+          "group": $group,
+          "stdout": $stdout,
+          "stderr": $stderr
+        }
+      }
+    }' >>"$RESULTS_JSONL"
+}
+
+emit_json_record_python() {
+  local name="$1" command_text="$2" out_tmp="$3" err_tmp="$4"
+  local rc="$5" elapsed="$6" started_at="$7" ended_at="$8" grouped="$9"
+  local category outcome check_id
+  category="$(ecs_category_for "$CURRENT_MODULE")"
+  [[ "$rc" -eq 0 ]] && outcome="success" || outcome="failure"
+  check_id="${name%.txt}"
+
+  python3 - "$RESULTS_JSONL" "$out_tmp" "$err_tmp" \
+    "$started_at" "$ended_at" "$ECS_VERSION" "$category" "$CURRENT_MODULE" \
+    "$outcome" "$HOST_SAFE" "$VERSION" "$SCHEMA_VERSION" "$RUN_ID" "$MODE" \
+    "$SINCE_DAYS" "$check_id" "$name" "$command_text" "$rc" "$elapsed" "$grouped" <<'PY'
+import json, sys
+(
+    dest, out_file, err_file, started, ended, ecs_version, category, module,
+    outcome, host, tool_version, schema_version, run_id, mode, since_days,
+    check_id, check_name, command, rc, elapsed, group
+) = sys.argv[1:]
+
+with open(out_file, "r", encoding="utf-8", errors="replace") as f:
+    stdout = f.read()
+with open(err_file, "r", encoding="utf-8", errors="replace") as f:
+    stderr = f.read()
+
+obj = {
+    "@timestamp": started,
+    "message": f"LBT check {check_id} completed",
+    "ecs": {"version": ecs_version},
+    "event": {
+        "kind": "state",
+        "category": [category],
+        "type": ["info"],
+        "action": "collect",
+        "module": module,
+        "dataset": f"lbt.{module}",
+        "outcome": outcome,
+        "start": started,
+        "end": ended,
+        "duration": int(elapsed) * 1_000_000_000,
+    },
+    "host": {"hostname": host},
+    "agent": {"name": "lbt", "type": "lbt", "version": tool_version},
+    "tags": ["linux", "live-response", "backdoor-triage"],
+    "lbt": {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "mode": mode,
+        "since_days": int(since_days),
+        "check": {"id": check_id, "name": check_name},
+        "command": command,
+        "exit_status": int(rc),
+        "output": {"group": group, "stdout": stdout, "stderr": stderr},
+    },
+}
+with open(dest, "a", encoding="utf-8", newline="\n") as f:
+    json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+    f.write("\n")
+PY
+}
+
+emit_json_record() {
+  case "$JSON_ENGINE" in
+    jq) emit_json_record_jq "$@" ;;
+    python3) emit_json_record_python "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
+write_check_result() {
+  local name="$1" command_text="$2" out_tmp="$3" err_tmp="$4"
+  local rc="$5" elapsed="$6" started_at="$7" ended_at="$8"
+  local grouped
+  grouped="$(group_file_for "$name")"
+
+  if want_text; then
+    append_text_result "$name" "$command_text" "$out_tmp" "$rc" "$elapsed" "$started_at" "$grouped"
+  fi
+
+  if want_jsonl; then
+    if ! emit_json_record "$name" "$command_text" "$out_tmp" "$err_tmp" "$rc" "$elapsed" "$started_at" "$ended_at" "$grouped"; then
+      printf 'JSON export failed for %s\n' "$name" >>"$ERRORS"
+      JSON_FAILURES=$((JSON_FAILURES + 1))
+    fi
+  fi
+
+  append_error_block "$name" "$err_tmp"
+}
+
 run_to_file() {
   local name="$1"
   shift
-  local file="$OUT/$name"
+  local out_tmp err_tmp started_epoch ended_epoch elapsed rc started_at ended_at command_text
+
+  out_tmp="$(mktemp "$OUT/.stdout_XXXXXX")"
+  err_tmp="$(mktemp "$OUT/.stderr_XXXXXX")"
+  started_epoch="$(date +%s)"
+  started_at="$(date -u +%FT%TZ)"
+
+  printf -v command_text '%q ' "$@"
+  command_text="${command_text% }"
   progress "$name"
 
-  (
-    printf '# UTC: %s\n' "$(date -u +%FT%TZ)"
-    printf '# Command:'
-    printf ' %q' "$@"
-    printf '\n\n'
-    "$@"
-    local_rc=$?
-    printf '\n# Exit status: %s\n' "$local_rc"
-    exit "$local_rc"
-  ) >"$file" 2>>"$ERRORS" || true
+  "$@" >"$out_tmp" 2>"$err_tmp"
+  rc=$?
+
+  ended_epoch="$(date +%s)"
+  ended_at="$(date -u +%FT%TZ)"
+  elapsed=$((ended_epoch - started_epoch))
+
+  write_check_result "$name" "$command_text" "$out_tmp" "$err_tmp" "$rc" "$elapsed" "$started_at" "$ended_at"
+  rm -f -- "$out_tmp" "$err_tmp"
+  progress "$name completed [${elapsed}s]"
 }
 
 run_shell_to_file() {
   local name="$1"
   shift
   local cmd="$*"
-  local file="$OUT/$name"
+  local out_tmp err_tmp started_epoch ended_epoch elapsed rc started_at ended_at
+
+  out_tmp="$(mktemp "$OUT/.stdout_XXXXXX")"
+  err_tmp="$(mktemp "$OUT/.stderr_XXXXXX")"
+  started_epoch="$(date +%s)"
+  started_at="$(date -u +%FT%TZ)"
   progress "$name"
 
-  (
-    printf '# UTC: %s\n' "$(date -u +%FT%TZ)"
-    printf '# Command: %s\n\n' "$cmd"
-    /bin/bash -o pipefail -c "$cmd"
-    local_rc=$?
-    printf '\n# Exit status: %s\n' "$local_rc"
-    exit "$local_rc"
-  ) >"$file" 2>>"$ERRORS" || true
+  /bin/bash -o pipefail -c "$cmd" >"$out_tmp" 2>"$err_tmp"
+  rc=$?
+
+  ended_epoch="$(date +%s)"
+  ended_at="$(date -u +%FT%TZ)"
+  elapsed=$((ended_epoch - started_epoch))
+
+  write_check_result "$name" "$cmd" "$out_tmp" "$err_tmp" "$rc" "$elapsed" "$started_at" "$ended_at"
+  rm -f -- "$out_tmp" "$err_tmp"
+  progress "$name completed [${elapsed}s]"
 }
 
 module_log() {
+  CURRENT_MODULE="$1"
   log "Running module: $1"
 }
 
@@ -546,10 +827,12 @@ for t in lynis rkhunter chkrootkit osqueryi velociraptor; do
 done'
 }
 
-log "Linux Backdoor Triage Collector v$VERSION"
+
+log "LBT - Linux Backdoor Triage Collector v$VERSION"
 log "Host: $HOST_SAFE"
 log "Mode: $MODE | Recent window: $SINCE_DAYS days"
 log "Checks: $CHECK_FILTER"
+log "Format: $FORMAT${JSON_ENGINE:+ | JSON engine: $JSON_ENGINE}"
 log "Evidence directory: $OUT"
 if [[ $EUID -ne 0 ]]; then
   log "WARNING: not running as root; several checks will be incomplete."
@@ -576,9 +859,130 @@ if [[ "$MODE" == "full" ]]; then
   check_full
 fi
 
-# Final messages must be written before the manifest is generated. After the
-# manifest is created, no file inside $OUT should be modified.
-log "Collection finished. Review raw output; findings are not automatic proof of compromise."
+RUN_ENDED_AT="$(date -u +%FT%TZ)"
+RUN_ENDED_EPOCH="$(date +%s)"
+RUN_ELAPSED=$((RUN_ENDED_EPOCH - RUN_STARTED_EPOCH))
+
+log "Collection finished. Findings are evidence for review, not automatic proof of compromise."
+if want_jsonl && [[ "$JSON_FAILURES" -gt 0 ]]; then
+  log "WARNING: $JSON_FAILURES JSON record(s) failed to export."
+fi
+
+write_run_json_jq() {
+  local outcome="success"
+  [[ "$JSON_FAILURES" -eq 0 ]] || outcome="failure"
+
+  jq -cn \
+    --arg ts "$RUN_STARTED_AT" \
+    --arg end "$RUN_ENDED_AT" \
+    --arg ecs_version "$ECS_VERSION" \
+    --arg host "$HOST_SAFE" \
+    --arg arch "$HOST_ARCH" \
+    --arg os_name "$OS_NAME" \
+    --arg os_version "$OS_VERSION" \
+    --arg tool_version "$VERSION" \
+    --arg schema_version "$SCHEMA_VERSION" \
+    --arg run_id "$RUN_ID" \
+    --arg mode "$MODE" \
+    --arg checks "$CHECK_FILTER" \
+    --arg format "$FORMAT" \
+    --arg json_engine "$JSON_ENGINE" \
+    --arg evidence_dir "$OUT" \
+    --arg outcome "$outcome" \
+    --argjson since_days "$SINCE_DAYS" \
+    --argjson duration "$((RUN_ELAPSED * 1000000000))" \
+    --argjson json_failures "$JSON_FAILURES" \
+    '{
+      "@timestamp": $ts,
+      "ecs": {"version": $ecs_version},
+      "event": {
+        "kind": "state",
+        "category": ["host"],
+        "type": ["info"],
+        "action": "collection",
+        "module": "lbt",
+        "dataset": "lbt.run",
+        "outcome": $outcome,
+        "start": $ts,
+        "end": $end,
+        "duration": $duration
+      },
+      "host": {"hostname": $host, "architecture": $arch},
+      "os": {"name": $os_name, "version": $os_version, "type": "linux"},
+      "agent": {"name": "lbt", "type": "lbt", "version": $tool_version},
+      "lbt": {
+        "schema_version": $schema_version,
+        "run_id": $run_id,
+        "mode": $mode,
+        "since_days": $since_days,
+        "checks": $checks,
+        "format": $format,
+        "json_engine": $json_engine,
+        "json_failures": $json_failures,
+        "evidence_directory": $evidence_dir,
+        "records_file": "results.jsonl"
+      }
+    }' >"$RUN_JSON"
+}
+
+write_run_json_python() {
+  python3 - "$RUN_JSON" "$RUN_STARTED_AT" "$RUN_ENDED_AT" "$ECS_VERSION" \
+    "$HOST_SAFE" "$HOST_ARCH" "$OS_NAME" "$OS_VERSION" "$VERSION" "$SCHEMA_VERSION" \
+    "$RUN_ID" "$MODE" "$SINCE_DAYS" "$CHECK_FILTER" "$FORMAT" "$JSON_ENGINE" \
+    "$JSON_FAILURES" "$OUT" "$RUN_ELAPSED" <<'PY'
+import json, sys
+(
+    dest, started, ended, ecs_version, host, arch, os_name, os_version,
+    tool_version, schema_version, run_id, mode, since_days, checks, fmt,
+    json_engine, json_failures, evidence_dir, elapsed
+) = sys.argv[1:]
+
+failures = int(json_failures)
+obj = {
+    "@timestamp": started,
+    "ecs": {"version": ecs_version},
+    "event": {
+        "kind": "state",
+        "category": ["host"],
+        "type": ["info"],
+        "action": "collection",
+        "module": "lbt",
+        "dataset": "lbt.run",
+        "outcome": "success" if failures == 0 else "failure",
+        "start": started,
+        "end": ended,
+        "duration": int(elapsed) * 1_000_000_000,
+    },
+    "host": {"hostname": host, "architecture": arch},
+    "os": {"name": os_name, "version": os_version, "type": "linux"},
+    "agent": {"name": "lbt", "type": "lbt", "version": tool_version},
+    "lbt": {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "mode": mode,
+        "since_days": int(since_days),
+        "checks": checks,
+        "format": fmt,
+        "json_engine": json_engine,
+        "json_failures": failures,
+        "evidence_directory": evidence_dir,
+        "records_file": "results.jsonl",
+    },
+}
+with open(dest, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(obj, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+}
+
+if want_jsonl; then
+  case "$JSON_ENGINE" in
+    jq) write_run_json_jq ;;
+    python3) write_run_json_python ;;
+  esac
+fi
+
+# No evidence file is modified after the manifest is generated.
 log "Creating SHA256 evidence manifest."
 
 if command -v sha256sum >/dev/null 2>&1; then
